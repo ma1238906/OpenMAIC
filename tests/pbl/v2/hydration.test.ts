@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 import type {
   RuntimePayload,
@@ -9,25 +9,25 @@ import type {
 import { BrowserRuntimeStore, type RuntimeSessionInit, type RuntimeStore } from '@openmaic/storage';
 
 import { applyInstructorEvent } from '@/components/scene-renderers/pbl/v2/apply-instructor-event';
-import type { PBLProjectConfig } from '@/lib/pbl/types';
-import { recordEvent } from '@/lib/pbl/v2/operations/engagement';
-import { addEvaluation } from '@/lib/pbl/v2/operations/evaluation';
+import { recordEvent } from '@/lib/pbl/v2/operations/kernel/engagement';
+import { addEvaluation } from '@/lib/pbl/v2/operations/runtime/evaluation';
 import {
   advanceMicrotask,
   continueAfterHandover,
   resetProjectProgress,
   startMicrotask,
-} from '@/lib/pbl/v2/operations/progress';
-import { transitionProjectUiPhase } from '@/lib/pbl/v2/operations/runtime-events';
-import { addSubmission } from '@/lib/pbl/v2/operations/submission';
+} from '@/lib/pbl/v2/operations/kernel/progress';
+import { transitionProjectUiPhase } from '@/lib/pbl/v2/operations/kernel/runtime-events';
+import { addSubmission } from '@/lib/pbl/v2/operations/runtime/submission';
 import {
   clearPendingTaskCompletion,
   setPendingTaskCompletion,
-} from '@/lib/pbl/v2/operations/task-completion';
+} from '@/lib/pbl/v2/operations/kernel/task-completion';
 import { drainProjectRuntime } from '@/lib/pbl/v2/runtime/drain';
 import { foldPBLRuntime } from '@/lib/pbl/v2/runtime/fold';
 import {
   appendPBLRuntimeSnapshotIfChanged,
+  documentContainsLearnerState,
   hydratePBLProjectFromRuntime,
   hydratePBLScenesFromRuntime,
   synchronizePBLProjectRuntime,
@@ -40,6 +40,8 @@ import {
 import { makeScene, type Scene } from '@/lib/types/stage';
 import type { KVScope, KVStore } from '@openmaic/storage';
 import type { PBLProjectV2, PBLRuntimeEvent } from '@/lib/pbl/v2/types';
+import { withRuntimeStorageExclusiveLock } from '@/lib/utils/chat-storage-lock';
+import { legacyPBLSceneFixture } from '@/tests/fixtures/pbl-v1-scene';
 
 if (!('IDBKeyRange' in globalThis)) {
   Object.defineProperty(globalThis, 'IDBKeyRange', { value: IDBKeyRange, configurable: true });
@@ -48,6 +50,68 @@ if (!('IDBKeyRange' in globalThis)) {
 const STAGE_ID = 'stage-1';
 const SCENE_ID = 'scene-1';
 const LEARNER_KEY = 'anon:test-device';
+
+function readWriteLockManager(onAcquire?: (mode: LockMode) => void): Pick<LockManager, 'request'> {
+  type Waiter = {
+    mode: LockMode;
+    run(): void;
+  };
+  const states = new Map<string, { readers: number; writer: boolean; waiters: Waiter[] }>();
+  const stateFor = (name: string) => {
+    let state = states.get(name);
+    if (!state) {
+      state = { readers: 0, writer: false, waiters: [] };
+      states.set(name, state);
+    }
+    return state;
+  };
+  const pump = (name: string) => {
+    const state = stateFor(name);
+    if (state.writer || state.waiters.length === 0) return;
+    if (state.waiters[0]!.mode === 'exclusive') {
+      if (state.readers === 0) state.waiters.shift()!.run();
+      return;
+    }
+    while (state.waiters[0]?.mode === 'shared' && !state.writer) {
+      state.waiters.shift()!.run();
+    }
+  };
+  return {
+    request<T>(
+      name: string,
+      optionsOrCallback: LockOptions | (() => Promise<T> | T),
+      maybeCallback?: () => Promise<T> | T,
+    ): Promise<T> {
+      const options = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+      const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback!;
+      const mode = options?.mode ?? 'exclusive';
+      const state = stateFor(name);
+      return new Promise<T>((resolve, reject) => {
+        state.waiters.push({
+          mode,
+          run() {
+            if (mode === 'shared') state.readers += 1;
+            else state.writer = true;
+            onAcquire?.(mode);
+            void Promise.resolve()
+              .then(callback)
+              .then(resolve, reject)
+              .finally(() => {
+                if (mode === 'shared') state.readers -= 1;
+                else state.writer = false;
+                pump(name);
+              });
+          },
+        });
+        pump(name);
+      });
+    },
+  } as Pick<LockManager, 'request'>;
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 class MemoryKVStore implements KVStore {
   private readonly values = new Map<string, unknown>();
@@ -120,6 +184,7 @@ class MemoryRuntimeStore implements RuntimeStore {
 
   async deleteLearnerRuntime(): Promise<void> {}
   async deleteStageRuntime(): Promise<void> {}
+  async deleteAllRuntime(): Promise<void> {}
 }
 
 class ThrowingRuntimeStore extends MemoryRuntimeStore {
@@ -293,7 +358,6 @@ function makePBLScene(project: PBLProjectV2): Scene {
     },
     {
       type: 'pbl',
-      projectConfig: {} as PBLProjectConfig,
       projectV2: project,
     },
   );
@@ -334,6 +398,37 @@ async function ensureSession(store: MemoryRuntimeStore): Promise<RuntimeSession>
 }
 
 describe('PBL runtime hydration', () => {
+  it('skips a damaged hybrid without touching runtime or learner-state hydration', async () => {
+    const damagedHybrid = structuredClone(legacyPBLSceneFixture) as Scene;
+    if (damagedHybrid.content.type !== 'pbl') throw new Error('expected PBL scene');
+    Reflect.set(damagedHybrid.content, 'projectV2', { title: 'broken' });
+
+    const hydrated = await hydratePBLScenesFromRuntime(STAGE_ID, [damagedHybrid], {
+      store: new ThrowingRuntimeStore(),
+      kv: new MemoryKVStore(),
+      learnerKey: LEARNER_KEY,
+    });
+
+    expect(hydrated).toEqual([damagedHybrid]);
+    expect(hydrated[0]).toBe(damagedHybrid);
+    expect(documentContainsLearnerState({ title: 'broken' })).toBe(false);
+  });
+
+  it('skips a container-valid v2 project with no runnable milestones', async () => {
+    const project = makeProject();
+    project.milestones = [];
+    const scene = makePBLScene(project);
+
+    const hydrated = await hydratePBLScenesFromRuntime(STAGE_ID, [scene], {
+      store: new ThrowingRuntimeStore(),
+      kv: new MemoryKVStore(),
+      learnerKey: LEARNER_KEY,
+    });
+
+    expect(hydrated).toEqual([scene]);
+    expect(hydrated[0]).toBe(scene);
+  });
+
   it('returns unchanged scenes when runtime hydration throws for a scene', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const project = makeProject({ uiPhase: 'workspace' });
@@ -614,6 +709,49 @@ describe('PBL runtime hydration', () => {
     }
   });
 
+  it('enrolls hydration before later maintenance while waiting for an earlier drain', async () => {
+    let sharedAcquisitions = 0;
+    vi.stubGlobal('navigator', {
+      locks: readWriteLockManager((mode) => {
+        if (mode === 'shared') sharedAcquisitions += 1;
+      }),
+    });
+    const project = transitionProjectUiPhase(makeProject(), 'workspace');
+    const eventId = project.runtimeEvents![0]!.id;
+    const store = new SlowFirstAppendRuntimeStore(eventId);
+    const kv = new MemoryKVStore();
+
+    const priorDrain = drainProjectRuntime({
+      stageId: STAGE_ID,
+      sceneId: SCENE_ID,
+      project,
+      store,
+      kv,
+      learnerKey: LEARNER_KEY,
+    });
+    await store.appendStarted;
+    const hydrating = hydratePBLProjectFromRuntime({
+      stageId: STAGE_ID,
+      sceneId: SCENE_ID,
+      project,
+      store,
+      kv,
+      learnerKey: LEARNER_KEY,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const sharedAcquisitionsBeforeRelease = sharedAcquisitions;
+    const maintenance = withRuntimeStorageExclusiveLock(async () => {
+      store.records.splice(0);
+      store.sessions.splice(0);
+    });
+
+    store.release();
+    await Promise.all([priorDrain, hydrating, maintenance]);
+    expect(sharedAcquisitionsBeforeRelease).toBe(2);
+    expect(store.records).toEqual([]);
+    expect(store.sessions).toEqual([]);
+  });
+
   it('falls back to the document without a snapshot when the drain barrier times out', async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -661,6 +799,45 @@ describe('PBL runtime hydration', () => {
     } finally {
       store.release();
       warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains the shared maintenance lock after a timed-out hydration until work settles', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('navigator', { locks: readWriteLockManager() });
+    const project = transitionProjectUiPhase(makeProject(), 'workspace');
+    const eventId = project.runtimeEvents![0]!.id;
+    const store = new SlowFirstAppendRuntimeStore(eventId);
+
+    try {
+      const hydrating = hydrate(project, store);
+      let hydrationSettled = false;
+      const hydrationOutcome = hydrating.then(
+        () => {
+          hydrationSettled = true;
+        },
+        () => {
+          hydrationSettled = true;
+        },
+      );
+      await store.appendStarted;
+      await vi.advanceTimersByTimeAsync(20_001);
+      await Promise.resolve();
+      expect(hydrationSettled).toBe(true);
+
+      let maintenanceStarted = false;
+      const maintenance = withRuntimeStorageExclusiveLock(async () => {
+        maintenanceStarted = true;
+      });
+      await Promise.resolve();
+      expect(maintenanceStarted).toBe(false);
+
+      store.release();
+      await Promise.all([hydrationOutcome, maintenance]);
+      expect(maintenanceStarted).toBe(true);
+    } finally {
+      store.release();
       vi.useRealTimers();
     }
   });
@@ -807,6 +984,48 @@ describe('PBL runtime hydration', () => {
         (record) => (record.payload as PBLRuntimeStorePayload).kind === 'pbl_snapshot',
       ),
     ).toHaveLength(1);
+  });
+
+  it('skips a duplicate snapshot when optional learner-state members were omitted', async () => {
+    const store = new MemoryRuntimeStore();
+    const project = makeProject({ uiPhase: 'workspace' });
+    project.submissions.push({
+      id: 'sub-undefined-filename',
+      microtaskId: 'mt-1',
+      kind: 'text',
+      content: 'Learner answer',
+      filename: undefined,
+      createdAt: '2026-05-29T00:01:00.000Z',
+    });
+    const learnerState = extractLearnerState(project);
+
+    const firstAppend = await appendPBLRuntimeSnapshotIfChanged({
+      store,
+      stageId: STAGE_ID,
+      sceneId: SCENE_ID,
+      learnerKey: LEARNER_KEY,
+      project,
+      learnerState,
+      records: [],
+      reason: 'self_heal',
+    });
+    const session = await ensureSession(store);
+    const records = await store.listRecords(session.id, { sceneId: SCENE_ID });
+    const secondAppend = await appendPBLRuntimeSnapshotIfChanged({
+      store,
+      stageId: STAGE_ID,
+      sceneId: SCENE_ID,
+      learnerKey: LEARNER_KEY,
+      project,
+      learnerState,
+      records,
+      reason: 'self_heal',
+    });
+
+    expect(firstAppend).toBe(true);
+    expect(secondAppend).toBe(false);
+    expect(records[0]!.payload).not.toHaveProperty('learnerState.submissions.0.filename');
+    expect(project.submissions[0]).toHaveProperty('filename', undefined);
   });
 
   it('preserves document-only transient fields on a fold-match hydration', async () => {

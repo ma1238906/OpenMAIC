@@ -13,7 +13,7 @@ import type { StageStore } from '@/lib/api/stage-api';
 import { createStageAPI } from '@/lib/api/stage-api';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useWhiteboardHistoryStore } from '@/lib/store/whiteboard-history';
-import { useMediaGenerationStore, isMediaPlaceholder } from '@/lib/store/media-generation';
+import { useMediaGenerationStore, type MediaTask } from '@/lib/store/media-generation';
 import type { AudioPlayer } from '@/lib/utils/audio-player';
 import type {
   Action,
@@ -35,7 +35,11 @@ import type {
   WidgetAnnotationAction,
   WidgetRevealAction,
 } from '@/lib/types/action';
-import type { CodeLine } from '@openmaic/dsl';
+import type { CodeLine, PPTVideoElement } from '@openmaic/dsl';
+import {
+  resolveVideoMediaForElement,
+  type VideoMediaTaskResolution,
+} from '@/lib/media/media-task-resolution';
 import {
   EFFECT_AUTO_CLEAR_MS,
   MAX_VIDEO_WAIT_MS,
@@ -67,6 +71,48 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const COMMON_LATEX_COMMAND =
+  /\\(?:alpha|beta|cdot|delta|dfrac|frac|gamma|infty|int|lambda|left|lim|mu|neq|omega|pi|pm|prod|rightarrow|right|sigma|sqrt|sum|text|tfrac|theta|times)\b/;
+
+function getDelimitedLatex(content: string): string | null {
+  const trimmed = content.trim();
+
+  if (trimmed.length > 4 && trimmed.startsWith('$$') && trimmed.endsWith('$$')) {
+    return trimmed.slice(2, -2).trim();
+  }
+  if (
+    trimmed.length > 2 &&
+    trimmed.startsWith('$') &&
+    trimmed.endsWith('$') &&
+    !trimmed.startsWith('$$') &&
+    !trimmed.endsWith('$$')
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+
+  return null;
+}
+
+function getLikelyLatexMath(content: string): string | null {
+  const trimmed = content.trim();
+  if (!trimmed || trimmed.startsWith('<')) return null;
+
+  const delimitedLatex = getDelimitedLatex(trimmed);
+  if (delimitedLatex !== null) return delimitedLatex;
+  if (/^[A-Za-z]:\\/.test(trimmed)) return null;
+  if (COMMON_LATEX_COMMAND.test(trimmed) || /[_^]\{/.test(trimmed)) return trimmed;
+
+  const commands = trimmed.match(/\\[A-Za-z]+/g) ?? [];
+  if (commands.length === 0) return null;
+  if (commands.length === 1) {
+    return /\\[A-Za-z]+\s*\{[^{}]*\}/.test(trimmed) ? trimmed : null;
+  }
+  if (!/[=+\-*/^_{}]/.test(trimmed)) return null;
+
+  const commandCharacters = commands.reduce((total, command) => total + command.length, 0);
+  return commandCharacters / trimmed.length >= 0.15 ? trimmed : null;
+}
+
 /** Convert raw code string to CodeLine array with unique IDs */
 function codeToLines(code: string): CodeLine[] {
   return code.split('\n').map((content, i) => ({
@@ -81,6 +127,31 @@ function generateLineIds(count: number): string[] {
   return Array.from({ length: count }, () => `L_${++lineIdCounter}_${Date.now().toString(36)}`);
 }
 
+/** Resolve the video element and its renderer-equivalent media binding for an action. */
+export function resolveActionVideoMedia(
+  stageStore: StageStore,
+  tasks: Readonly<Record<string, MediaTask>>,
+  elementId: string,
+): VideoMediaTaskResolution<MediaTask> | undefined {
+  const { stage, scenes, currentSceneId } = stageStore.getState();
+  const orderedScenes = currentSceneId
+    ? [
+        scenes.find((scene) => scene.id === currentSceneId),
+        ...scenes.filter((scene) => scene.id !== currentSceneId),
+      ]
+    : scenes;
+
+  for (const scene of orderedScenes) {
+    if (!scene || scene.content.type !== 'slide') continue;
+    const element = scene.content.canvas.elements.find(
+      (candidate): candidate is PPTVideoElement =>
+        candidate.id === elementId && candidate.type === 'video',
+    );
+    if (element) return resolveVideoMediaForElement(tasks, element, stage?.id);
+  }
+  return undefined;
+}
+
 // ==================== ActionEngine ====================
 
 /** Callback for sending messages to widget iframe */
@@ -88,6 +159,7 @@ export type WidgetMessageCallback = (type: string, payload: Record<string, unkno
 
 export interface ActionExecutionOptions {
   silent?: boolean;
+  signal?: AbortSignal;
 }
 
 export class ActionEngine {
@@ -154,7 +226,7 @@ export class ActionEngine {
         return;
       // Synchronous — Video
       case 'play_video':
-        return this.executePlayVideo(action as PlayVideoAction);
+        return this.executePlayVideo(action as PlayVideoAction, options);
 
       // Synchronous
       case 'speech':
@@ -263,99 +335,90 @@ export class ActionEngine {
 
   // ==================== Synchronous — Video ====================
 
-  private async executePlayVideo(action: PlayVideoAction): Promise<void> {
-    // Resolve the video element to a generated media reference.
-    // action.elementId is the slide element ID (e.g. video_abc123), but the media
-    // store is keyed by generated media refs, so we need to bridge the two.
-    const placeholderId = this.resolveMediaPlaceholderId(action.elementId);
+  private async executePlayVideo(
+    action: PlayVideoAction,
+    options: ActionExecutionOptions = {},
+  ): Promise<void> {
+    if (options.signal?.aborted) return;
+    const resolveBinding = () =>
+      resolveActionVideoMedia(
+        this.stageStore,
+        useMediaGenerationStore.getState().tasks,
+        action.elementId,
+      );
+    const binding = resolveBinding();
 
-    if (placeholderId) {
-      const task = useMediaGenerationStore.getState().getTask(placeholderId);
+    if (binding) {
+      const task = binding.task;
       if (task && task.status !== 'done') {
         // Wait for media to be ready (or fail)
         await new Promise<void>((resolve) => {
-          const unsubscribe = useMediaGenerationStore.subscribe((state) => {
-            const t = state.tasks[placeholderId];
+          let unsubscribe = () => {};
+          const finish = () => {
+            unsubscribe();
+            options.signal?.removeEventListener('abort', finish);
+            resolve();
+          };
+          unsubscribe = useMediaGenerationStore.subscribe((state) => {
+            const t = resolveActionVideoMedia(this.stageStore, state.tasks, action.elementId)?.task;
             if (!t || t.status === 'done' || t.status === 'failed') {
-              unsubscribe();
-              resolve();
+              finish();
             }
           });
+          options.signal?.addEventListener('abort', finish, { once: true });
           // Check again in case it resolved between getState and subscribe
-          const current = useMediaGenerationStore.getState().tasks[placeholderId];
+          const current = resolveBinding()?.task;
           if (!current || current.status === 'done' || current.status === 'failed') {
-            unsubscribe();
-            resolve();
+            finish();
           }
         });
 
+        if (options.signal?.aborted) return;
+
         // If failed, skip playback
-        if (useMediaGenerationStore.getState().tasks[placeholderId]?.status === 'failed') {
+        if (resolveBinding()?.task?.status === 'failed') {
           return;
         }
       }
     }
 
+    if (options.signal?.aborted) return;
     useCanvasStore.getState().playVideo(action.elementId);
 
     // Wait until the video finishes playing, with a safety timeout to prevent
     // the playback engine from hanging indefinitely if the video element is
     // invalid or the state change is missed.
     return new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        unsubscribe();
-        log.warn(`[playVideo] Timeout waiting for video ${action.elementId} to finish`);
-        resolve();
-      }, MAX_VIDEO_WAIT_MS);
-      const unsubscribe = useCanvasStore.subscribe((state) => {
-        if (state.playingVideoElementId !== action.elementId) {
-          clearTimeout(timeout);
-          unsubscribe();
-          resolve();
-        }
-      });
-      if (useCanvasStore.getState().playingVideoElementId !== action.elementId) {
+      let finished = false;
+      let unsubscribe = () => {};
+      const finish = () => {
+        if (finished) return;
+        finished = true;
         clearTimeout(timeout);
         unsubscribe();
+        options.signal?.removeEventListener('abort', abortPlayback);
         resolve();
+      };
+      const abortPlayback = () => {
+        if (useCanvasStore.getState().playingVideoElementId === action.elementId) {
+          useCanvasStore.getState().pauseVideo();
+        }
+        finish();
+      };
+      const timeout = setTimeout(() => {
+        log.warn(`[playVideo] Timeout waiting for video ${action.elementId} to finish`);
+        finish();
+      }, MAX_VIDEO_WAIT_MS);
+      unsubscribe = useCanvasStore.subscribe((state) => {
+        if (state.playingVideoElementId !== action.elementId) {
+          finish();
+        }
+      });
+      options.signal?.addEventListener('abort', abortPlayback, { once: true });
+      if (useCanvasStore.getState().playingVideoElementId !== action.elementId) {
+        finish();
       }
     });
-  }
-
-  // ==================== Helpers — Media Resolution ====================
-
-  /**
-   * Look up a video/image element's generated media reference in the current stage's scenes.
-   * Returns mediaRef first, then legacy src if it's a media placeholder ID.
-   */
-  private resolveMediaPlaceholderId(elementId: string): string | null {
-    const { scenes, currentSceneId } = this.stageStore.getState();
-
-    // Search current scene first for efficiency, then remaining scenes
-    const orderedScenes = currentSceneId
-      ? [
-          scenes.find((s) => s.id === currentSceneId),
-          ...scenes.filter((s) => s.id !== currentSceneId),
-        ]
-      : scenes;
-
-    for (const scene of orderedScenes) {
-      if (!scene || scene.type !== 'slide') continue;
-      const elements = (
-        scene.content as {
-          canvas?: { elements?: Array<{ id: string; src?: string; mediaRef?: string }> };
-        }
-      )?.canvas?.elements;
-      if (!Array.isArray(elements)) continue;
-      const el = elements.find((e: { id: string }) => e.id === elementId);
-      if (el && typeof el.mediaRef === 'string') {
-        return el.mediaRef;
-      }
-      if (el && typeof el.src === 'string' && isMediaPlaceholder(el.src)) {
-        return el.src;
-      }
-    }
-    return null;
   }
 
   // ==================== Synchronous — Whiteboard ====================
@@ -380,12 +443,25 @@ export class ActionEngine {
     action: WbDrawTextAction,
     options: ActionExecutionOptions = {},
   ): Promise<void> {
+    let htmlContent = action.content ?? '';
+    if (!htmlContent) return; // nothing to draw
+
+    const latex = getLikelyLatexMath(htmlContent);
+    if (latex !== null) {
+      return this.executeWbDrawLatex(
+        {
+          ...action,
+          type: 'wb_draw_latex',
+          latex,
+        },
+        options,
+      );
+    }
+
     const wb = this.stageAPI.whiteboard.get();
     if (!wb.success || !wb.data) return;
 
     const fontSize = action.fontSize ?? 18;
-    let htmlContent = action.content ?? '';
-    if (!htmlContent) return; // nothing to draw
     if (!htmlContent.startsWith('<')) {
       htmlContent = `<p style="font-size: ${fontSize}px;">${htmlContent}</p>`;
     }
@@ -615,6 +691,12 @@ export class ActionEngine {
     if (!wb.success || !wb.data) return;
 
     const lines = codeToLines(action.code);
+    const suppliedLineIds = (action as WbDrawCodeAction & { lineIds?: string[] }).lineIds;
+    if (suppliedLineIds?.length === lines.length) {
+      lines.forEach((line, index) => {
+        line.id = suppliedLineIds[index];
+      });
+    }
 
     this.stageAPI.whiteboard.addElement(
       {
@@ -658,7 +740,11 @@ export class ActionEngine {
 
     let lines: CodeLine[] = [...element.lines];
     const newContentLines = action.content ? action.content.split('\n') : [];
-    const newLineIds = generateLineIds(newContentLines.length);
+    const suppliedLineIds = (action as WbEditCodeAction & { newLineIds?: string[] }).newLineIds;
+    const newLineIds =
+      suppliedLineIds?.length === newContentLines.length
+        ? suppliedLineIds
+        : generateLineIds(newContentLines.length);
 
     switch (action.operation) {
       case 'insert_after': {

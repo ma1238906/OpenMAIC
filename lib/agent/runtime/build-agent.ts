@@ -10,13 +10,17 @@
  */
 import {
   Agent,
+  type AfterToolCallContext,
+  type AfterToolCallResult,
   type AgentMessage,
+  type AgentOptions,
   type AgentTool,
   type StreamFn,
 } from '@earendil-works/pi-agent-core';
 import type { Api, Model } from '@earendil-works/pi-ai';
 import { makeAllowlistGate } from './allowlist';
 import { makeQuotaHook } from './quota';
+import { hasLengthToolCallProvenance } from './stream-fn';
 import { V0_ALLOWLIST } from '../tools/registry';
 
 // pi needs *a* model object on state; the injected StreamFn ignores it and uses
@@ -38,14 +42,28 @@ const STUB_MODEL = {
 export interface BuildAgentOptions {
   streamFn: StreamFn;
   systemPrompt: string;
-  tools: AgentTool<never, never>[];
+  tools: AgentTool[];
+  /** Tool names allowed for this agent. Defaults to the editor v0 allowlist. */
+  allowedToolNames?: ReadonlySet<string>;
   /** Prior conversation turns to seed the agent with, so it has multi-turn memory. */
   history?: AgentMessage[];
+  /** Optional Pi context transform, used by the Director's native compaction path. */
+  transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+  /** Optional Pi message conversion, required when a context transform emits custom roles. */
+  convertToLlm?: AgentOptions['convertToLlm'];
+  /** Optional request-scoped hook composed with the shared quota hook. */
+  afterToolCall?: (
+    context: AfterToolCallContext,
+    signal?: AbortSignal,
+  ) => Promise<AfterToolCallResult | undefined> | AfterToolCallResult | undefined;
 }
 
 export function buildAgent(opts: BuildAgentOptions): Agent {
-  return new Agent({
+  const quotaHook = makeQuotaHook({ remaining: () => Number.MAX_SAFE_INTEGER });
+  const agent = new Agent({
     streamFn: opts.streamFn,
+    transformContext: opts.transformContext,
+    convertToLlm: opts.convertToLlm,
     toolExecution: 'sequential',
     initialState: {
       systemPrompt: opts.systemPrompt,
@@ -55,9 +73,52 @@ export function buildAgent(opts: BuildAgentOptions): Agent {
       // conversation in context — without this the agent is stateless per turn.
       ...(opts.history && opts.history.length > 0 ? { messages: opts.history } : {}),
     },
-    beforeToolCall: makeAllowlistGate(V0_ALLOWLIST),
-    afterToolCall: makeQuotaHook({ remaining: () => Number.MAX_SAFE_INTEGER }),
+    beforeToolCall: makeAllowlistGate(opts.allowedToolNames ?? V0_ALLOWLIST),
+    afterToolCall: async (context, signal) => {
+      const markerIsError =
+        typeof context.result === 'object' &&
+        context.result !== null &&
+        Object.prototype.hasOwnProperty.call(context.result, 'isError') &&
+        (context.result as { isError?: unknown }).isError === true;
+      const baseIsError = context.isError || markerIsError;
+      const normalizedContext = baseIsError ? { ...context, isError: true } : context;
+      const quotaResult = await quotaHook(normalizedContext);
+      const requestResult = await opts.afterToolCall?.(normalizedContext, signal);
+      if (!quotaResult && !requestResult && !baseIsError) return undefined;
+      return {
+        ...quotaResult,
+        ...requestResult,
+        isError: baseIsError || quotaResult?.isError === true || requestResult?.isError === true,
+        terminate: quotaResult?.terminate === true || requestResult?.terminate === true,
+      };
+    },
   });
+
+  let terminalBarrierActive = false;
+  agent.subscribe((event) => {
+    if (
+      event.type === 'turn_end' &&
+      event.message.role === 'assistant' &&
+      event.message.stopReason === 'length' &&
+      hasLengthToolCallProvenance(event.message)
+    ) {
+      terminalBarrierActive = true;
+      agent.clearAllQueues();
+    } else if (event.type === 'agent_end') {
+      terminalBarrierActive = false;
+    }
+  });
+
+  const steer = agent.steer.bind(agent);
+  agent.steer = (message) => {
+    if (!terminalBarrierActive) steer(message);
+  };
+  const followUp = agent.followUp.bind(agent);
+  agent.followUp = (message) => {
+    if (!terminalBarrierActive) followUp(message);
+  };
+
+  return agent;
 }
 
 export function buildSystemPrompt(scene?: { id: string; title: string }): string {
@@ -76,10 +137,10 @@ export function buildSystemPrompt(scene?: { id: string; title: string }): string
     // (read_scene_content, regenerate_scene, regenerate_scene_actions,
     // edit_interactive_html, edit_elements). Without firm limits the model
     // cheerfully claims it can add slides or edit quizzes, which it cannot.
-    'Before answering questions about the slide or regenerating it, call `read_scene_content` (with only the sceneId) to see what is actually on the slide.',
-    'Your editing capabilities are: (1) regenerate the WHOLE slide — its content (text/layout/images) and its narration together — to match the user\'s instruction, by calling `regenerate_scene` with the sceneId and a natural-language instruction; (2) regenerate ONLY the spoken narration and playback actions (讲解旁白/动作) by calling `regenerate_scene_actions` with the sceneId; (3) fix a bug in an INTERACTIVE scene (an interactive web page / widget) — e.g. a button that does nothing, a control with no effect, an animation that never shows, or a layout glitch — by calling `edit_interactive_html`: first `read_scene_content` to see the page HTML, then supply the sceneId and one or more { oldText, newText } edits where each oldText is a unique exact snippet copied from that HTML; (4) edit SPECIFIC slide elements (color, position, size, rotation, opacity, etc. — not text content) by calling `edit_elements` with the sceneId and a natural-language instruction such as "make the title blue and move it up". Prefer `edit_elements` when the user asks to tweak existing elements; prefer `regenerate_scene` when they want a wholesale rewrite. For slide tools, outline and content are resolved automatically — supply only the sceneId (and the instruction); never fabricate slide content.',
+    'Before answering questions about the slide or regenerating it, call `read_scene_content` to see what is actually on the slide. Follow `Next manifestOffset` pages on an unusually large slide until the target is located, then request exact target records with `elementIds`.',
+    'Your editing capabilities are: (1) regenerate the WHOLE slide, including content and narration, by calling `regenerate_scene` with the sceneId and a natural-language instruction; (2) regenerate ONLY spoken narration and playback actions by calling `regenerate_scene_actions`; (3) fix a bug in an INTERACTIVE scene by calling `edit_interactive_html` after reading its exact HTML; (4) edit SPECIFIC existing slide elements with guarded JSON Patch by calling `edit_elements`. For element edits, first call `read_scene_content` and use its indexed element JSON. Before adding or replacing `/elements/N/...`, first test `/elements/N/id` against the id you just read. Never patch the `_index` or `_path` projection metadata. `edit_elements` supports geometry, renderer-visible styles, text content, and shape-label content. Prefer it for targeted changes and prefer `regenerate_scene` for a wholesale rewrite.',
     'Whole-slide regeneration (`regenerate_scene`) and element edits (`edit_elements`) work for SLIDE scenes only. For INTERACTIVE scenes you cannot regenerate the whole scene, but you CAN fix reported bugs in the page via `edit_interactive_html` — it applies your exact-text edits, changing only the matched regions and preserving the rest; if an edit does not apply, refine the oldText and retry. When changing a visible label or one attribute, keep the element tags and id intact — include them in both oldText and newText and change only the text/value between them; never replace a whole element with bare text. For quiz, PBL or whiteboard scenes you cannot edit the content — say so honestly and suggest the user edits those on the canvas.',
-    'You CANNOT add, delete, reorder or duplicate slides; you cannot insert quizzes; you cannot modify the whiteboard; you cannot rewrite slide text content or image sources via `edit_elements` (geometry/style only — for new wording use `regenerate_scene` or the canvas). When asked for anything outside these capabilities, do NOT claim you can — briefly say you cannot do that yet and point them to the canvas.',
+    'You CANNOT add, delete, reorder or duplicate slides or elements; you cannot insert quizzes; you cannot modify the whiteboard; and you cannot replace image or media sources via `edit_elements`. The initial JSON Patch tool supports `test`, `add`, and `replace`; `add` is only for an optional property on an existing element and never creates an element. When asked for anything outside these capabilities, do NOT claim you can. Briefly say you cannot do that yet and point them to the canvas.',
     // Wholesale caveat retained: regeneration rebuilds the scene, so specific
     // existing elements/cues cannot be guaranteed to survive unchanged.
     'Regeneration rebuilds the slide and/or its actions wholesale, so it cannot guarantee that specific existing elements, spotlight/laser cues, their count, or their bindings survive unchanged. If the user asks to regenerate under such a "keep X exactly" constraint, prefer `edit_elements` for the specific tweaks, or explain that regeneration rebuilds the scene and cannot guarantee that.',

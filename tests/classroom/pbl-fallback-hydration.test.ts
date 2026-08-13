@@ -7,23 +7,27 @@ import type {
 } from '@openmaic/dsl';
 import type { KVScope, KVStore, RuntimeSessionInit, RuntimeStore } from '@openmaic/storage';
 
-const { saveStageDataMock } = vi.hoisted(() => ({
+const { saveStageDataMock, saveStageDataIncrementalMock } = vi.hoisted(() => ({
   saveStageDataMock: vi.fn().mockResolvedValue(undefined),
+  saveStageDataIncrementalMock: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('@/lib/utils/stage-storage', () => ({
   saveStageData: (...args: unknown[]) => saveStageDataMock(...args),
+  saveStageDataIncremental: (...args: unknown[]) => saveStageDataIncrementalMock(...args),
   loadStageData: vi.fn().mockResolvedValue(null),
 }));
 vi.mock('@/lib/pbl/v2/runtime/document-persistence', () => ({
   preparePBLScenesForDocumentPersistence: async (_stageId: string, scenes: Scene[]) => scenes,
 }));
 vi.mock('@/lib/utils/database', () => ({
-  db: { stageOutlines: { put: vi.fn(), get: vi.fn() } },
+  db: {
+    stageOutlines: { put: vi.fn(), get: vi.fn() },
+    stageFolders: { delete: vi.fn().mockResolvedValue(undefined) },
+  },
 }));
 
-import type { PBLProjectConfig } from '@/lib/pbl/types';
-import { transitionProjectUiPhase } from '@/lib/pbl/v2/operations/runtime-events';
+import { transitionProjectUiPhase } from '@/lib/pbl/v2/operations/kernel/runtime-events';
 import { drainProjectRuntime } from '@/lib/pbl/v2/runtime/drain';
 import type { PBLProjectV2 } from '@/lib/pbl/v2/types';
 import {
@@ -106,6 +110,7 @@ class MemoryRuntimeStore implements RuntimeStore {
 
   async deleteLearnerRuntime(): Promise<void> {}
   async deleteStageRuntime(): Promise<void> {}
+  async deleteAllRuntime(): Promise<void> {}
 }
 
 function makeProject(overrides: Partial<PBLProjectV2> = {}): PBLProjectV2 {
@@ -157,7 +162,6 @@ function makePBLScene(project: PBLProjectV2): Scene {
     },
     {
       type: 'pbl',
-      projectConfig: {} as PBLProjectConfig,
       projectV2: project,
     },
   );
@@ -175,6 +179,8 @@ function makeStage(id = STAGE_ID): Stage {
 beforeEach(() => {
   saveStageDataMock.mockClear();
   saveStageDataMock.mockResolvedValue(undefined);
+  saveStageDataIncrementalMock.mockClear();
+  saveStageDataIncrementalMock.mockResolvedValue(undefined);
   useStageStore.getState().clearStore();
 });
 
@@ -194,6 +200,43 @@ afterEach(async () => {
 });
 
 describe('classroom server fallback PBL hydration', () => {
+  it('hydrates runtime chats before committing a server fallback', async () => {
+    const stage = makeStage('stage-chat-fallback');
+    const serverScene = makePBLScene(makeProject());
+    const token = claimStageSceneLoadToken();
+    const chatState = {
+      chats: [
+        {
+          id: 'runtime-chat',
+          type: 'qa' as const,
+          title: 'Runtime chat',
+          status: 'completed' as const,
+          messages: [],
+          config: { agentIds: [] },
+          toolCalls: [],
+          pendingToolCalls: [],
+          createdAt: 1_000,
+          updatedAt: 2_000,
+        },
+      ],
+      chatSnapshot: { sessions: [], restoreMarker: null },
+    };
+    const applyStageAndScenes = vi.fn();
+
+    await expect(
+      applyHydratedClassroomFallbackScenes({
+        loadToken: token,
+        stage,
+        scenes: [serverScene],
+        hydrateScenes: async () => [serverScene],
+        hydrateChats: async () => chatState,
+        applyStageAndScenes,
+      }),
+    ).resolves.toBe(true);
+
+    expect(applyStageAndScenes).toHaveBeenCalledWith(stage, [serverScene], chatState);
+  });
+
   it('applies fallback scenes under the navigation token that started the request', async () => {
     const stage = makeStage('stage-a');
     const serverScene = makePBLScene(makeProject());
@@ -343,6 +386,7 @@ describe('classroom server fallback PBL hydration', () => {
 
     await vi.advanceTimersByTimeAsync(600);
     expect(saveStageDataMock).not.toHaveBeenCalled();
+    expect(saveStageDataIncrementalMock).not.toHaveBeenCalled();
     expect(useStageStore.getState().stage).toBeNull();
     expect(useStageStore.getState().scenes).toEqual([]);
 
@@ -350,14 +394,16 @@ describe('classroom server fallback PBL hydration', () => {
     await applying;
     await vi.advanceTimersByTimeAsync(600);
 
-    expect(saveStageDataMock).toHaveBeenCalledOnce();
-    expect(saveStageDataMock).toHaveBeenCalledWith(
+    expect(saveStageDataIncrementalMock).toHaveBeenCalledOnce();
+    expect(saveStageDataIncrementalMock).toHaveBeenCalledWith(
       STAGE_ID,
+      [{ kind: 'structure' }, { kind: 'stage' }],
       expect.objectContaining({
         stage,
         scenes: [serverScene],
         currentSceneId: SCENE_ID,
       }),
+      expect.any(Number),
     );
   });
 });
