@@ -2,23 +2,26 @@ name: Sync Upstream
 
 on:
   schedule:
-    - cron: '0 */12 * * *'   # 每12小时执行一次，可自行调整
-  workflow_dispatch:          # 也支持手动触发
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
 
-      - name: Sync upstream
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/THU-MAIC/OpenMAIC.git
-          git fetch upstream
-          git merge upstream/main --allow-unrelated-histories --no-edit || exit 1
-          git push origin main
+      - name: Sync with upstream
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: main
+          force: false
+          repository: THU-MAIC/OpenMAIC
